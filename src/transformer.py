@@ -15,6 +15,8 @@ class Config:
     n_heads: int = 4
     n_layers: int = 4
     range_init: float=0.02
+    use_rope:bool = True
+    rope_base:int = 10_000
 
 class LayerNorm(nn.Module):
     def __init__(self, cfg:Config, eps=1e-5):
@@ -52,6 +54,29 @@ class PosEmbed(nn.Module):
     def forward(self, tokens: Int[Tensor, "batch position"]):
         batch, seq_len = tokens.shape
         return einops.repeat(self.W_P[:seq_len], "seq d_model -> batch seq d_model", batch=batch)
+    
+class RoPE(nn.Module):
+    def __init__(self, cfg:Config):
+        super().__init__()
+        self.d_model = cfg.d_model
+        self.n_ctx = cfg.n_ctx
+        self.inv_freq = cfg.rope_base**(-2*t.arange(0, cfg.d_model, 2)/self.d_model)
+        self._build_cache()
+
+    def _build_cache(self):
+        seq = t.arange(self.n_ctx).float()
+        freqs = einops.einsum(seq, self.inv_freq, 'i, j -> i j')
+
+        emb = t.cat((freqs, freqs), dim=-1) # duplication
+
+        self.cos_cache = emb.cos()[None, None, :, :]
+        self.sin_cache = emb.sin()[None, None, :, :]
+
+    def rotate_half(self, x):
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        return t.stack((-x2, x1), dim=-1).flatten(-2)
+
 
 class Attention(nn.Module):
     def __init__(self, cfg:Config):
@@ -69,20 +94,41 @@ class Attention(nn.Module):
         nn.init.normal_(self.W_K, std=self.cfg.range_init)
         nn.init.normal_(self.W_V, std=self.cfg.range_init)
         nn.init.normal_(self.W_O, std=self.cfg.range_init)
+        if self.cfg.use_rope:
+            self.rope = RoPE(cfg)
+
+    def _apply_rope(self, q, k):
+        b, seq_len, n_heads, d_head = q.shape
+        device = q.device
+        cos = self.rope.cos_cache[:, :, :seq_len, :].to(device)
+        sin = self.rope.sin_cache[:, :, :seq_len, :].to(device)
+
+        q_flat = q.view(b, seq_len, n_heads*d_head)
+        k_flat = k.view(b, seq_len, n_heads*d_head)
+
+        q_rot = (q_flat*cos) + (self.rope.rotate_half(q_flat)*sin)
+        k_rot = (k_flat*cos) + (self.rope.rotate_half(k_flat)*sin)
+        return q_rot.view(b, seq_len, n_heads, d_head), k_rot.view(b, seq_len, n_heads, d_head)
+
+    def _apply_causal_masking(self, attn_weights:Float[Tensor, "batch n_heads seqQ seqK"]):
+        seq = attn_weights.shape[-1]
+        mask = t.tril(t.ones(seq, seq, device=attn_weights.device), diagonal=0)
+        return attn_weights.where(mask==1, -t.inf)
 
     def forward(self, x):
         # x.shape = (batch, seq, d_model)
         batch, seq, _ = x.shape
         Q = einops.einsum(x, self.W_Q, "b s d, n d h -> b s n h") + self.b_Q
-        
+
         K = einops.einsum(x, self.W_K, "b s d, n d h -> b s n h") + self.b_K
+        
+        if self.cfg.use_rope:
+            Q, K = self._apply_rope(Q, K)
 
         attn_weights = einops.einsum(Q, K, "b sQ n d, b sK n d -> b n sQ sK") /(self.cfg.d_head**0.5) # (batch, n_heads, seq_Q, seq_K)
         
         # Causal masking of the weights
-        mask = t.tril(t.ones(seq, seq, device=attn_weights.device), diagonal=0)
-        masked_weights = attn_weights.where(mask==1, -t.inf)
-
+        masked_weights = self._apply_causal_masking(attn_weights)
         attn_scores = masked_weights.softmax(dim=-1)
 
         V = einops.einsum(x, self.W_V, "b s d, n d h -> b s n h") + self.b_V
@@ -145,7 +191,9 @@ class Transformer(nn.Module):
         self.unembed = Unembed(cfg)
 
     def forward(self, tokens):
-        residual = self.embed(tokens) + self.pos_embed(tokens)
+        residual = self.embed(tokens)
+        if not self.cfg.use_rope:
+            residual += self.pos_embed(tokens)
         residual = self.blocks(residual)
         logits = self.unembed(self.ln_final(residual))
         return logits

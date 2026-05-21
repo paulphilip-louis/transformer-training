@@ -6,7 +6,7 @@ Here are some characteristics of my transformer implementation:
 - use of LayerNorm
 - d_mlp = 4*d_model ; d_model = n_heads * d_head
 - MLP is composed of two projections, with a GeLU module in between
-- Positional embedding is simply added to embedding
+- Rotary positional embedding
 
 # Pre-training
 
@@ -14,7 +14,7 @@ I pre-trained the model over [TinyStories dataset](https://huggingface.co/datase
 
 I used an AdamW optimizer with Linear Warmup + Cosine Annealing scheduler.
 
-Achieved a training loss of ~3 (cross-entropy).
+Achieved a training loss of ~2.7 (cross-entropy).
 
 # Next steps: 
 ## For pre-training
