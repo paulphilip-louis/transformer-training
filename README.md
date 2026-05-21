@@ -18,7 +18,6 @@ Achieved a training loss of ~2.7 (cross-entropy).
 
 # Next steps: 
 ## For pre-training
-- RoPE embedding
 - wandb logging
 - Pre-train on distributed GPUs
 
